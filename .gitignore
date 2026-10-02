@@ -30,7 +30,7 @@ wheels/
 .ipynb_checkpoints
 
 # Model files (too large for GitHub)
-*.joblib
+# *.joblib  # Commented out - we need these for Render deployment
 *.pkl
 *.h5
 
