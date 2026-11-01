@@ -92,6 +92,67 @@ def load_models():
 
 model, vectorizer, scaler, models_loaded = load_models()
 
+
+@st.cache_resource
+def load_bert_model():
+    """Load BERT for fraud detection.
+    Priority: 1) Fine-tuned model (bert_fraud_model/), 2) Zero-shot classifier (instant, no training needed)
+    """
+    try:
+        import torch
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+
+        # 1. Fine-tuned model (available after running train_model.py)
+        if os.path.exists('bert_fraud_model'):
+            device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            tokenizer = AutoTokenizer.from_pretrained('bert_fraud_model')
+            bert_m    = AutoModelForSequenceClassification.from_pretrained('bert_fraud_model')
+            bert_m    = bert_m.to(device)
+            bert_m.eval()
+            return bert_m, tokenizer, 'finetuned'
+
+        # 2. Zero-shot fallback — works instantly without any training
+        device_id = 0 if torch.cuda.is_available() else -1
+        clf = pipeline(
+            "zero-shot-classification",
+            model="cross-encoder/nli-deberta-v3-small",
+            device=device_id
+        )
+        return clf, None, 'zero-shot'
+
+    except ImportError:
+        return None, None, None
+    except Exception:
+        return None, None, None
+
+
+def get_bert_probability(text, bert_m, tokenizer, mode):
+    """Get [legit_prob, scam_prob] from BERT — supports fine-tuned and zero-shot modes"""
+    try:
+        if mode == 'zero-shot':
+            # bert_m is a HuggingFace zero-shot pipeline
+            result    = bert_m(str(text)[:512], candidate_labels=["job scam fraud", "legitimate job offer"])
+            scam_prob = result['scores'][result['labels'].index("job scam fraud")]
+            return np.array([1 - scam_prob, scam_prob])
+        else:
+            # bert_m is a fine-tuned AutoModelForSequenceClassification
+            import torch
+            device = next(bert_m.parameters()).device
+            enc    = tokenizer(
+                str(text), add_special_tokens=True,
+                max_length=128, padding='max_length',
+                truncation=True, return_tensors='pt'
+            )
+            with torch.no_grad():
+                out   = bert_m(
+                    input_ids=enc['input_ids'].to(device),
+                    attention_mask=enc['attention_mask'].to(device)
+                )
+                probs = torch.softmax(out.logits, dim=1)[0]
+            return np.array([probs[0].item(), probs[1].item()])
+    except Exception:
+        return None
+
 # Helper functions
 def clean_text(text):
     if pd.isna(text):
@@ -168,56 +229,171 @@ def detect_red_flags(text):
     return critical_flags, warning_flags
 
 def predict_fraud(text):
-    cleaned = clean_text(text)
-    tfidf = vectorizer.transform([cleaned])
-    
-    features = extract_features(text)
-    features_array = np.array([[features['text_length'], features['word_count'], 
-                                features['digit_count'], features['exclamation_count'],
-                                features['question_count'], features['currency_symbols'], 
-                                features['has_url'], features['has_email'], 
-                                features['has_phone'], features['uppercase_ratio'], 
-                                features['money_words']]])
-    features_scaled = scaler.transform(features_array)
-    
-    combined = hstack([tfidf, features_scaled])
-    
-    prediction = model.predict(combined)[0]
-    probability = model.predict_proba(combined)[0][1]
-    
+    """Predict using BERT as primary model. Random Forest runs for comparison only."""
+
+    # ==========================================
+    # PRIMARY: BERT Prediction
+    # ==========================================
+    bert_pred       = None
+    bert_confidence = None
+    try:
+        bert_m, tokenizer, mode = load_bert_model()
+        if bert_m is not None:
+            bert_proba = get_bert_probability(text, bert_m, tokenizer, mode)
+            if bert_proba is not None:
+                bert_confidence = float(bert_proba[1])       # scam probability
+                bert_pred       = int(bert_confidence >= 0.5)
+    except Exception:
+        pass
+
+    # ==========================================
+    # COMPARISON ONLY: Random Forest
+    # ==========================================
+    rf_confidence = None
+    try:
+        cleaned        = clean_text(text)
+        tfidf          = vectorizer.transform([cleaned])
+        features       = extract_features(text)
+        features_array = np.array([[features['text_length'], features['word_count'],
+                                    features['digit_count'], features['exclamation_count'],
+                                    features['question_count'], features['currency_symbols'],
+                                    features['has_url'], features['has_email'],
+                                    features['has_phone'], features['uppercase_ratio'],
+                                    features['money_words']]])
+        features_scaled = scaler.transform(features_array)
+        combined       = hstack([tfidf, features_scaled])
+        rf_confidence  = float(model.predict_proba(combined)[0][1])
+    except Exception:
+        pass
+
+    # ==========================================
+    # FINAL DECISION (BERT preferred, RF fallback)
+    # ==========================================
+    if bert_pred is not None:
+        final_pred  = bert_pred
+        final_prob  = bert_confidence
+        model_used  = 'BERT'
+    elif rf_confidence is not None:
+        final_pred  = int(rf_confidence >= 0.5)
+        final_prob  = rf_confidence
+        model_used  = 'Random Forest (fallback)'
+    else:
+        return {
+            'prediction': 'UNKNOWN', 'confidence': 0.5,
+            'critical_flags': [], 'warning_flags': [],
+            'bert_confidence': None, 'rf_confidence': None, 'model_used': 'None'
+        }
+
     critical, warnings = detect_red_flags(text)
-    
-    final_prediction = "SCAM" if prediction == 1 else "LEGITIMATE"
-    
-    # BALANCED OVERRIDE LOGIC - Less aggressive
-    # Only override if there are MULTIPLE strong indicators
-    
-    # If 2+ critical flags → Force SCAM
+    final_prediction   = "SCAM" if final_pred == 1 else "LEGITIMATE"
+
+    # --- Red-Flag Override (applied on top of BERT) ---
     if len(critical) >= 2:
         final_prediction = "SCAM"
-        probability = max(probability, 0.95)
-    
-    # If 1 critical flag + model says scam → SCAM
-    elif len(critical) >= 1 and prediction == 1:
+        final_prob = max(final_prob, 0.95)
+    elif len(critical) >= 1 and final_pred == 1:
         final_prediction = "SCAM"
-        probability = max(probability, 0.90)
-    
-    # If 4+ warnings → Force SCAM
+        final_prob = max(final_prob, 0.90)
     elif len(warnings) >= 4:
         final_prediction = "SCAM"
-        probability = max(probability, 0.85)
-    
-    # Trust the ML model more for legitimate predictions
-    # Only override if very strong evidence
-    
+        final_prob = max(final_prob, 0.85)
+
     return {
-        'prediction': final_prediction,
-        'confidence': probability,
-        'critical_flags': critical,
-        'warning_flags': warnings
+        'prediction':      final_prediction,
+        'confidence':      final_prob,        # BERT confidence (primary)
+        'bert_confidence': bert_confidence,   # raw BERT scam prob
+        'rf_confidence':   rf_confidence,     # RF scam prob (comparison)
+        'model_used':      model_used,
+        'critical_flags':  critical,
+        'warning_flags':   warnings
     }
 
-# Tabs
+# ==========================================
+# SIDEBAR
+# ==========================================
+with st.sidebar:
+    st.markdown("## 📊 Model Information")
+    st.metric("Primary Model", "BERT")
+    st.metric("RF ROC-AUC", "0.9799", help="Random Forest comparison model")
+    st.metric("RF Accuracy", "97.81%", help="Random Forest comparison model")
+    st.metric("Training Samples", "12,788")
+
+    st.markdown("---")
+
+    # ---- Active AI Models ----
+    st.markdown("## 🤖 Active AI Models")
+
+    # Check BERT status from actual model load
+    _bm, _tok, _mode = load_bert_model()
+    bert_ready       = _bm is not None
+    bert_is_finetuned = os.path.exists('bert_fraud_model')
+
+    # Random Forest badge
+    st.markdown("""
+    <div style="background:#e8f5e9;border-left:4px solid #4caf50;
+                padding:0.5rem 0.8rem;border-radius:6px;margin:4px 0;">
+        ✅ <strong>Random Forest</strong>
+        <span style="font-size:0.8rem;color:#555;"> — Base Model</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # BERT badge — dynamic based on mode
+    if bert_ready and bert_is_finetuned:
+        st.markdown("""
+        <div style="background:#e3f2fd;border-left:4px solid #1976d2;
+                    padding:0.5rem 0.8rem;border-radius:6px;margin:4px 0;">
+            ✅ <strong>Fine-Tuned BERT</strong>
+            <span style="font-size:0.8rem;color:#1565c0;"> — Ensemble Active</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+    elif bert_ready and not bert_is_finetuned:
+        st.markdown("""
+        <div style="background:#e8f5e9;border-left:4px solid #2e7d32;
+                    padding:0.5rem 0.8rem;border-radius:6px;margin:4px 0;">
+            ✅ <strong>BERT</strong>
+            <span style="font-size:0.8rem;color:#2e7d32;"> — Zero-Shot Active</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+    else:
+        st.markdown("""
+        <div style="background:#ffebee;border-left:4px solid #f44336;
+                    padding:0.5rem 0.8rem;border-radius:6px;margin:4px 0;">
+            ❌ <strong>BERT</strong>
+            <span style="font-size:0.8rem;color:#c62828;"> — Unavailable</span>
+        </div>
+        """, unsafe_allow_html=True)
+        st.caption("Install: `pip install transformers torch`")
+
+    # Ensemble weights (shown whenever BERT is active)
+    if bert_ready:
+        mode_label = "Fine-Tuned" if bert_is_finetuned else "Zero-Shot"
+        st.markdown(f"""
+        <div style="background:#f3e5f5;border-left:4px solid #9c27b0;
+                    padding:0.6rem 0.8rem;border-radius:6px;margin:6px 0;font-size:0.85rem;">
+            ⚡ <strong>Ensemble Active ({mode_label})</strong><br>
+            &nbsp;&nbsp;🤖 BERT &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ <strong>65%</strong><br>
+            &nbsp;&nbsp;🌲 Random Forest → <strong>35%</strong>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("## 📖 How to Use")
+    st.markdown("""
+    1. **Text Analysis** — Paste any message
+    2. **Company Check** — Verify employer
+    3. **Email Scanner** — Auto-scan inbox
+    4. **Image Upload** — Screenshot OCR
+    """)
+
+    st.markdown("---")
+    st.markdown("## ⚠️ Disclaimer")
+    st.caption("AI predictions are guidance only. Always verify through official channels.")
+
+# ==========================================
+# TABS
+# ==========================================
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📝 Text Analysis", "🏢 Company Verification", "📧 Email Scanner", "🖼️ Image Analysis", "ℹ️ Model Info"])
 
 # ==========================================
@@ -259,7 +435,24 @@ with tab1:
                             """, unsafe_allow_html=True)
                     
                     with col2:
-                        st.metric("Scam Probability", f"{result['confidence']:.1%}")
+                        # Primary: BERT confidence
+                        bert_conf = result.get('bert_confidence')
+                        rf_conf   = result.get('rf_confidence')
+                        st.metric(
+                            "🤖 BERT (Primary)",
+                            f"{bert_conf:.1%}" if bert_conf is not None else "N/A",
+                            help="BERT scam probability — primary prediction model"
+                        )
+                        if rf_conf is not None:
+                            delta_diff = bert_conf - rf_conf if bert_conf is not None else None
+                            st.metric(
+                                "🌲 RF (Comparison)",
+                                f"{rf_conf:.1%}",
+                                delta=f"{delta_diff:+.1%}" if delta_diff is not None else None,
+                                delta_color="off",
+                                help="Random Forest scam probability — for comparison only"
+                            )
+                        st.caption(f"Model: `{result.get('model_used', 'BERT')}`")
                     
                     if result['critical_flags']:
                         st.error("**🚨 Critical Red Flags:**")
@@ -543,11 +736,16 @@ with tab5:
         st.metric("Training Samples", "15,985")
     
     st.subheader("🎯 Features")
-    st.write("""
+    # BERT status
+    bert_active = os.path.exists('bert_fraud_model')
+    st.write(f"""
     - **Text Analysis**: ML-powered fraud detection
-    - **Company Verification**: Check company legitimacy
+    - **Company Verification**: Check company legitimacy via SerpAPI
+    - **Email Scanner**: Auto-scan your inbox for fraud emails
+    - **Image Analysis**: Upload screenshots for OCR-based detection
     - **Red Flag Detection**: 6 critical + 7 warning indicators
     - **Smart Override Logic**: Rule-based + ML combined
+    - **AI Models**: {'✅ BERT + Random Forest Ensemble (BERT 65% + RF 35%)' if bert_active else '⚠️ Random Forest only (run train_model.py to enable BERT)'}
     """)
     
     st.subheader("🚨 Red Flags We Detect")

@@ -95,6 +95,47 @@ def load_model_artifacts():
         st.error(f"Error loading model: {e}")
         st.stop()
 
+
+@st.cache_resource
+def load_bert_model():
+    """Load fine-tuned BERT model for ensemble prediction (if available)"""
+    import os
+    if not os.path.exists('bert_fraud_model'):
+        return None, None, None
+    try:
+        import torch
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        tokenizer = AutoTokenizer.from_pretrained('bert_fraud_model')
+        bert_m    = AutoModelForSequenceClassification.from_pretrained('bert_fraud_model')
+        bert_m    = bert_m.to(device)
+        bert_m.eval()
+        return bert_m, tokenizer, device
+    except ImportError:
+        return None, None, None
+    except Exception:
+        return None, None, None
+
+
+def get_bert_probability(text, bert_m, tokenizer, device):
+    """Get [legit_prob, scam_prob] from fine-tuned BERT"""
+    try:
+        import torch
+        enc = tokenizer(
+            str(text), add_special_tokens=True,
+            max_length=128, padding='max_length',
+            truncation=True, return_tensors='pt'
+        )
+        with torch.no_grad():
+            out   = bert_m(
+                input_ids=enc['input_ids'].to(device),
+                attention_mask=enc['attention_mask'].to(device)
+            )
+            probs = torch.softmax(out.logits, dim=1)[0]
+        return np.array([probs[0].item(), probs[1].item()])
+    except Exception:
+        return None
+
 # OCR function
 def extract_text_from_image(image):
     """Extract text from image using OCR"""
@@ -225,22 +266,29 @@ def detect_red_flags(text):
 
 # Predict function
 def predict_fraud(text, model, vectorizer, scaler):
-    """Make prediction on input text"""
-    # Text vectorization
-    text_vec = vectorizer.transform([text])
-    
-    # Extract features
-    features = extract_features(text).reshape(1, -1)
+    """Make prediction using BERT + Random Forest ensemble"""
+    # --- Random Forest prediction ---
+    text_vec        = vectorizer.transform([text])
+    features        = extract_features(text).reshape(1, -1)
     features_scaled = scaler.transform(features)
-    
-    # Combine
-    X_combined = hstack([text_vec, csr_matrix(features_scaled)])
-    
-    # Predict
-    prediction = model.predict(X_combined)[0]
-    probability = model.predict_proba(X_combined)[0]
-    
-    return prediction, probability
+    X_combined      = hstack([text_vec, csr_matrix(features_scaled)])
+    rf_prediction   = model.predict(X_combined)[0]
+    rf_probability  = model.predict_proba(X_combined)[0]
+
+    # --- BERT ensemble (if model available) ---
+    try:
+        bert_m, tokenizer, device = load_bert_model()
+        if bert_m is not None:
+            bert_proba = get_bert_probability(text, bert_m, tokenizer, device)
+            if bert_proba is not None:
+                # Weighted ensemble: BERT 65% + Random Forest 35%
+                ensemble_proba = 0.65 * bert_proba + 0.35 * rf_probability
+                final_pred     = int(ensemble_proba[1] >= 0.5)
+                return final_pred, ensemble_proba
+    except Exception:
+        pass  # Silently fall back to RF
+
+    return rf_prediction, rf_probability
 
 # Display results function
 def display_results(text, prediction, probability, red_flags, source_type="text"):
@@ -349,6 +397,17 @@ with st.sidebar:
     4. Review prediction & red flags
     """)
     
+    st.markdown("---")
+    st.header("🤖 Active AI Models")
+    import os as _os
+    st.markdown("✅ **Random Forest** (Base Model)")
+    if _os.path.exists('bert_fraud_model'):
+        st.markdown("✅ **Fine-Tuned BERT** (Ensemble)")
+        st.caption("Prediction: BERT 65% + RF 35%")
+    else:
+        st.markdown("⚠️ **BERT** — not yet trained")
+        st.caption("Run `train_model.py` to activate BERT")
+
     st.markdown("---")
     st.header("⚠️ Disclaimer")
     st.caption("AI predictions are guidance only. Always verify through official channels.")

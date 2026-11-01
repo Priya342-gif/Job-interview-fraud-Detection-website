@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold, RandomizedSearchCV
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
@@ -179,12 +179,14 @@ print(f"✓ Combined feature shape: {X_train_combined.shape}")
 # ============================================
 print("\n[5/7] Handling class imbalance with SMOTE...")
 print(f"Before SMOTE - Scam: {y_train.sum()}, Legit: {(y_train == 0).sum()}")
-
-smote = SMOTE(random_state=42, k_neighbors=5)
-X_train_resampled, y_train_resampled = smote.fit_resample(X_train_combined, y_train)
-
-print(f"After SMOTE  - Scam: {y_train_resampled.sum()}, Legit: {(y_train_resampled == 0).sum()}")
-print(f"✓ Balanced training set: {X_train_resampled.shape[0]} samples")
+try:
+    smote = SMOTE(random_state=42, k_neighbors=5)
+    X_train_resampled, y_train_resampled = smote.fit_resample(X_train_combined, y_train)
+    print(f"After SMOTE  - Scam: {y_train_resampled.sum()}, Legit: {(y_train_resampled == 0).sum()}")
+    print(f"✓ Balanced training set: {X_train_resampled.shape[0]} samples")
+except Exception as smote_err:
+    print(f"⚠ SMOTE failed: {smote_err}. Using original imbalanced data.")
+    X_train_resampled, y_train_resampled = X_train_combined, y_train
 
 # ============================================
 # 6. TRAIN MULTIPLE MODELS
@@ -203,41 +205,241 @@ results = {}
 
 for name, model in models.items():
     print(f"\n→ Training {name}...")
-    
-    # Train
-    model.fit(X_train_resampled, y_train_resampled)
-    
-    # Predict
-    y_pred = model.predict(X_test_combined)
-    
-    # Metrics
-    if hasattr(model, 'predict_proba'):
-        y_proba = model.predict_proba(X_test_combined)[:, 1]
-    elif hasattr(model, 'decision_function'):
-        y_proba = model.decision_function(X_test_combined)
-    else:
-        y_proba = y_pred
-    
-    roc_auc = roc_auc_score(y_test, y_proba)
-    
-    # Classification report
-    report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
-    
-    results[name] = {
-        'model': model,
-        'roc_auc': roc_auc,
-        'accuracy': report['accuracy'],
-        'precision_scam': report.get('1', {}).get('precision', 0),
-        'recall_scam': report.get('1', {}).get('recall', 0),
-        'f1_scam': report.get('1', {}).get('f1-score', 0),
-        'y_pred': y_pred,
-        'y_proba': y_proba
+    try:
+        # Train
+        model.fit(X_train_resampled, y_train_resampled)
+
+        # Predict
+        y_pred = model.predict(X_test_combined)
+
+        # Metrics
+        if hasattr(model, 'predict_proba'):
+            y_proba = model.predict_proba(X_test_combined)[:, 1]
+        elif hasattr(model, 'decision_function'):
+            y_proba = model.decision_function(X_test_combined)
+        else:
+            y_proba = y_pred
+
+        roc_auc = roc_auc_score(y_test, y_proba)
+
+        # Classification report
+        report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+
+        results[name] = {
+            'model': model,
+            'roc_auc': roc_auc,
+            'accuracy': report['accuracy'],
+            'precision_scam': report.get('1', {}).get('precision', 0),
+            'recall_scam': report.get('1', {}).get('recall', 0),
+            'f1_scam': report.get('1', {}).get('f1-score', 0),
+            'y_pred': y_pred,
+            'y_proba': y_proba
+        }
+
+        print(f"  ✓ ROC-AUC: {roc_auc:.4f}")
+        print(f"  ✓ Accuracy: {report['accuracy']:.4f}")
+        print(f"  ✓ Scam Precision: {results[name]['precision_scam']:.4f}")
+        print(f"  ✓ Scam Recall: {results[name]['recall_scam']:.4f}")
+    except Exception as train_err:
+        print(f"  ✗ Error training {name}: {train_err}. Skipping.")
+
+# ============================================
+# 6b. HYPERPARAMETER TUNING (Random Forest)
+# ============================================
+print("\n[6b] Hyperparameter tuning for Random Forest...")
+try:
+    rf_param_dist = {
+        'n_estimators':     [100, 200, 300, 500],
+        'max_depth':        [10, 20, 30, None],
+        'min_samples_split':[2, 5, 10],
+        'min_samples_leaf': [1, 2, 4],
+        'max_features':     ['sqrt', 'log2']
     }
-    
-    print(f"  ✓ ROC-AUC: {roc_auc:.4f}")
-    print(f"  ✓ Accuracy: {report['accuracy']:.4f}")
-    print(f"  ✓ Scam Precision: {results[name]['precision_scam']:.4f}")
-    print(f"  ✓ Scam Recall: {results[name]['recall_scam']:.4f}")
+    rf_tuning_base = RandomForestClassifier(random_state=42, class_weight='balanced', n_jobs=-1)
+    rf_search = RandomizedSearchCV(
+        rf_tuning_base, rf_param_dist,
+        n_iter=15,
+        cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
+        scoring='roc_auc', n_jobs=-1, random_state=42, verbose=0
+    )
+    rf_search.fit(X_train_resampled, y_train_resampled)
+    best_rf_tuned   = rf_search.best_estimator_
+    y_pred_tuned    = best_rf_tuned.predict(X_test_combined)
+    y_proba_tuned   = best_rf_tuned.predict_proba(X_test_combined)[:, 1]
+    roc_auc_tuned   = roc_auc_score(y_test, y_proba_tuned)
+    report_tuned    = classification_report(y_test, y_pred_tuned, output_dict=True, zero_division=0)
+    print(f"  Best params: {rf_search.best_params_}")
+    print(f"  Tuned RF ROC-AUC: {roc_auc_tuned:.4f}")
+    if roc_auc_tuned > results.get('Random Forest', {}).get('roc_auc', 0):
+        results['Random Forest (Tuned)'] = {
+            'model':          best_rf_tuned,
+            'roc_auc':        roc_auc_tuned,
+            'accuracy':       report_tuned['accuracy'],
+            'precision_scam': report_tuned.get('1', {}).get('precision', 0),
+            'recall_scam':    report_tuned.get('1', {}).get('recall',    0),
+            'f1_scam':        report_tuned.get('1', {}).get('f1-score',  0),
+            'y_pred':         y_pred_tuned,
+            'y_proba':        y_proba_tuned
+        }
+        print("  ✓ Tuned RF outperforms default → added to comparison")
+    else:
+        print("  ✓ Default RF is already near-optimal for this dataset")
+except Exception as tune_err:
+    print(f"  ⚠ Hyperparameter tuning error: {tune_err}. Skipping.")
+
+# ============================================
+# 6c. FINE-TUNE BERT MODEL
+# ============================================
+print("\n[6c] Fine-tuning BERT for fraud detection...")
+BERT_TRAINED = False
+try:
+    import torch
+    from torch.utils.data import Dataset, DataLoader
+    from transformers import (
+        AutoTokenizer, AutoModelForSequenceClassification,
+        AdamW, get_linear_schedule_with_warmup
+    )
+    import os
+
+    BERT_MODEL_NAME = 'bert-base-uncased'
+    BERT_MAX_LEN    = 128
+    BERT_BATCH_SIZE = 16
+    BERT_EPOCHS     = 3
+    BERT_LR         = 2e-5
+    BERT_SAVE_PATH  = 'bert_fraud_model'
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"  Device: {device}")
+
+    bert_tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
+
+    class FraudDataset(Dataset):
+        """PyTorch Dataset for fraud text classification"""
+        def __init__(self, texts, labels, tokenizer, max_len):
+            self.texts     = [str(t) if t is not None else "" for t in texts]
+            self.labels    = labels
+            self.tokenizer = tokenizer
+            self.max_len   = max_len
+
+        def __len__(self):
+            return len(self.texts)
+
+        def __getitem__(self, idx):
+            enc = self.tokenizer(
+                self.texts[idx],
+                add_special_tokens=True,
+                max_length=self.max_len,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            return {
+                'input_ids':      enc['input_ids'].squeeze(),
+                'attention_mask': enc['attention_mask'].squeeze(),
+                'labels':         torch.tensor(self.labels[idx], dtype=torch.long)
+            }
+
+    # Cap training size for feasibility (CPU/limited VRAM)
+    MAX_BERT_TRAIN = min(len(X_text_train), 8000)
+    train_ds = FraudDataset(
+        X_text_train[:MAX_BERT_TRAIN].tolist(),
+        y_train[:MAX_BERT_TRAIN].tolist(),
+        bert_tokenizer, BERT_MAX_LEN
+    )
+    test_ds = FraudDataset(
+        X_text_test.tolist(), y_test.tolist(), bert_tokenizer, BERT_MAX_LEN
+    )
+    train_dl = DataLoader(train_ds, batch_size=BERT_BATCH_SIZE, shuffle=True)
+    test_dl  = DataLoader(test_ds,  batch_size=BERT_BATCH_SIZE, shuffle=False)
+
+    bert_clf        = AutoModelForSequenceClassification.from_pretrained(BERT_MODEL_NAME, num_labels=2)
+    bert_clf        = bert_clf.to(device)
+    optimizer_bert  = AdamW(bert_clf.parameters(), lr=BERT_LR, weight_decay=0.01)
+    total_steps     = len(train_dl) * BERT_EPOCHS
+    scheduler_bert  = get_linear_schedule_with_warmup(
+        optimizer_bert,
+        num_warmup_steps=max(1, total_steps // 10),
+        num_training_steps=total_steps
+    )
+
+    print(f"  Training BERT: {BERT_EPOCHS} epochs | {MAX_BERT_TRAIN} samples | batch {BERT_BATCH_SIZE}")
+    bert_clf.train()
+    for epoch in range(BERT_EPOCHS):
+        epoch_loss = 0.0
+        for step, batch in enumerate(train_dl):
+            try:
+                optimizer_bert.zero_grad()
+                out = bert_clf(
+                    input_ids=batch['input_ids'].to(device),
+                    attention_mask=batch['attention_mask'].to(device),
+                    labels=batch['labels'].to(device)
+                )
+                out.loss.backward()
+                torch.nn.utils.clip_grad_norm_(bert_clf.parameters(), 1.0)
+                optimizer_bert.step()
+                scheduler_bert.step()
+                epoch_loss += out.loss.item()
+                if (step + 1) % 100 == 0:
+                    print(f"    Epoch {epoch+1}/{BERT_EPOCHS} | Step {step+1}/{len(train_dl)} "
+                          f"| Avg Loss: {epoch_loss/(step+1):.4f}")
+            except RuntimeError as batch_err:
+                print(f"    ⚠ Batch skipped: {batch_err}")
+                continue
+        print(f"  ✓ Epoch {epoch+1} complete | Avg Loss: {epoch_loss/max(1, len(train_dl)):.4f}")
+
+    # ---- BERT Evaluation ----
+    bert_clf.eval()
+    bert_preds, bert_probs = [], []
+    with torch.no_grad():
+        for batch in test_dl:
+            try:
+                out   = bert_clf(
+                    input_ids=batch['input_ids'].to(device),
+                    attention_mask=batch['attention_mask'].to(device)
+                )
+                probs = torch.softmax(out.logits, dim=1)
+                bert_preds.extend(torch.argmax(probs, dim=1).cpu().numpy())
+                bert_probs.extend(probs[:, 1].cpu().numpy())
+            except Exception as eval_err:
+                print(f"    ⚠ Eval batch error: {eval_err}")
+                continue
+
+    bert_preds     = np.array(bert_preds)
+    bert_probs_arr = np.array(bert_probs)
+
+    if len(bert_preds) > 0:
+        bert_roc_auc = roc_auc_score(y_test[:len(bert_preds)], bert_probs_arr)
+        bert_report  = classification_report(
+            y_test[:len(bert_preds)], bert_preds, output_dict=True, zero_division=0
+        )
+        results['Fine-Tuned BERT'] = {
+            'model':          None,           # saved separately as directory
+            'roc_auc':        bert_roc_auc,
+            'accuracy':       bert_report['accuracy'],
+            'precision_scam': bert_report.get('1', {}).get('precision', 0),
+            'recall_scam':    bert_report.get('1', {}).get('recall',    0),
+            'f1_scam':        bert_report.get('1', {}).get('f1-score',  0),
+            'y_pred':         bert_preds,
+            'y_proba':        bert_probs_arr
+        }
+        print(f"  ✓ BERT ROC-AUC   : {bert_roc_auc:.4f}")
+        print(f"  ✓ BERT Accuracy  : {bert_report['accuracy']:.4f}")
+        print(f"  ✓ BERT Precision : {bert_report.get('1', {}).get('precision', 0):.4f}")
+        print(f"  ✓ BERT Recall    : {bert_report.get('1', {}).get('recall', 0):.4f}")
+        # Save BERT model & tokenizer
+        os.makedirs(BERT_SAVE_PATH, exist_ok=True)
+        bert_clf.save_pretrained(BERT_SAVE_PATH)
+        bert_tokenizer.save_pretrained(BERT_SAVE_PATH)
+        print(f"  ✓ BERT saved → '{BERT_SAVE_PATH}/'")
+        BERT_TRAINED = True
+    else:
+        print("  ⚠ No BERT predictions collected — check batch errors above.")
+
+except ImportError as ie:
+    print(f"  ⚠ BERT dependencies not installed: {ie}")
+    print("  → Install with: pip install transformers torch")
+except Exception as bert_err:
+    print(f"  ⚠ BERT training failed: {bert_err}")
 
 # ============================================
 # 7. SELECT BEST MODEL
@@ -262,12 +464,21 @@ print(comparison_df.to_string(index=False))
 comparison_df.to_csv('model_comparison.csv', index=False)
 print("\n✓ Saved: model_comparison.csv")
 
-# Select best model based on ROC-AUC
-best_model_name = max(results, key=lambda x: results[x]['roc_auc'])
-best_model = results[best_model_name]['model']
+# Best sklearn model (model not None) → saved as .joblib
+sklearn_results = {k: v for k, v in results.items() if v['model'] is not None}
+if not sklearn_results:
+    raise RuntimeError("No sklearn models trained successfully. Check training errors above.")
+best_sklearn_name = max(sklearn_results, key=lambda x: sklearn_results[x]['roc_auc'])
+best_model        = sklearn_results[best_sklearn_name]['model']
 
-print(f"\n🏆 BEST MODEL: {best_model_name}")
-print(f"   ROC-AUC: {results[best_model_name]['roc_auc']:.4f}")
+# Overall best (may be BERT)
+best_model_name = max(results, key=lambda x: results[x]['roc_auc'])
+
+print(f"\n🏆 BEST SKLEARN MODEL : {best_sklearn_name}")
+print(f"   ROC-AUC            : {sklearn_results[best_sklearn_name]['roc_auc']:.4f}")
+if 'Fine-Tuned BERT' in results:
+    print(f"\n🤖 FINE-TUNED BERT ROC-AUC : {results['Fine-Tuned BERT']['roc_auc']:.4f}")
+print(f"\n🥇 OVERALL BEST : {best_model_name} (AUC={results[best_model_name]['roc_auc']:.4f})")
 
 # ============================================
 # 8. DETAILED EVALUATION OF BEST MODEL
@@ -328,16 +539,20 @@ print("✓ Saved: scaler.joblib")
 
 # Save metadata
 metadata = {
-    'best_model': best_model_name,
-    'roc_auc': results[best_model_name]['roc_auc'],
-    'accuracy': results[best_model_name]['accuracy'],
-    'precision_scam': results[best_model_name]['precision_scam'],
-    'recall_scam': results[best_model_name]['recall_scam'],
-    'f1_scam': results[best_model_name]['f1_scam'],
-    'train_samples': len(X_text_train),
-    'test_samples': len(X_text_test),
-    'vocab_size': len(vectorizer.vocabulary_),
-    'features': list(features_df.columns)
+    'best_model':      best_sklearn_name,
+    'best_overall':    best_model_name,
+    'bert_available':  BERT_TRAINED,
+    'bert_model_path': 'bert_fraud_model' if BERT_TRAINED else None,
+    'bert_roc_auc':    results['Fine-Tuned BERT']['roc_auc'] if BERT_TRAINED else None,
+    'roc_auc':         results[best_sklearn_name]['roc_auc'],
+    'accuracy':        results[best_sklearn_name]['accuracy'],
+    'precision_scam':  results[best_sklearn_name]['precision_scam'],
+    'recall_scam':     results[best_sklearn_name]['recall_scam'],
+    'f1_scam':         results[best_sklearn_name]['f1_scam'],
+    'train_samples':   len(X_text_train),
+    'test_samples':    len(X_text_test),
+    'vocab_size':      len(vectorizer.vocabulary_),
+    'features':        list(features_df.columns)
 }
 
 import json
@@ -348,10 +563,14 @@ print("✓ Saved: model_metadata.json")
 print("\n" + "="*60)
 print("✅ TRAINING COMPLETE!")
 print("="*60)
-print(f"\nBest Model: {best_model_name}")
-print(f"ROC-AUC: {results[best_model_name]['roc_auc']:.4f}")
-print(f"Accuracy: {results[best_model_name]['accuracy']:.4f}")
-print(f"Scam Detection Precision: {results[best_model_name]['precision_scam']:.4f}")
-print(f"Scam Detection Recall: {results[best_model_name]['recall_scam']:.4f}")
+print(f"\nBest Sklearn Model : {best_sklearn_name}")
+print(f"ROC-AUC            : {results[best_sklearn_name]['roc_auc']:.4f}")
+print(f"Accuracy           : {results[best_sklearn_name]['accuracy']:.4f}")
+print(f"Scam Precision     : {results[best_sklearn_name]['precision_scam']:.4f}")
+print(f"Scam Recall        : {results[best_sklearn_name]['recall_scam']:.4f}")
+if BERT_TRAINED:
+    print(f"\nFine-Tuned BERT ROC-AUC  : {results['Fine-Tuned BERT']['roc_auc']:.4f}")
+    print(f"Fine-Tuned BERT Accuracy : {results['Fine-Tuned BERT']['accuracy']:.4f}")
+    print(f"Ensemble (apps)          : BERT 65% + {best_sklearn_name} 35%")
 print("\nNext step: Run 'streamlit run app.py' to launch the web interface")
 print("="*60)

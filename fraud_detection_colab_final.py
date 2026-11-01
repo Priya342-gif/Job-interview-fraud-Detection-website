@@ -472,7 +472,7 @@ def predict_with_override(text):
     prediction = model.predict(combined)[0]
     probability = model.predict_proba(combined)[0][1]
     
-    # Detect red flags
+    # Detect red flagsisk
     critical, warnings = detect_red_flags(text)
     
     # OVERRIDE LOGIC
