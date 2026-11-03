@@ -709,16 +709,116 @@ with tab4:
     if not models_loaded:
         st.error("⚠️ Models not loaded!")
     else:
+        st.info("📸 Upload a screenshot of job posting or interview message for automatic text extraction and fraud analysis")
+        
         uploaded_file = st.file_uploader(
             "Upload job posting screenshot or image",
-            type=['png', 'jpg', 'jpeg']
+            type=['png', 'jpg', 'jpeg', 'webp', 'bmp']
         )
         
         if uploaded_file:
-            st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
+            col1, col2 = st.columns([1, 1])
             
-            if st.button("🔍 Analyze Image", type="primary"):
-                st.info("📸 OCR feature requires Tesseract installation. Please use Text Analysis tab for now.")
+            with col1:
+                st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
+            
+            with col2:
+                if st.button("🔍 Extract Text & Analyze", type="primary", use_container_width=True):
+                    try:
+                        # Import OCR libraries
+                        from PIL import Image
+                        import pytesseract
+                        
+                        with st.spinner("📸 Extracting text from image..."):
+                            # Open image
+                            image = Image.open(uploaded_file)
+                            
+                            # Perform OCR
+                            extracted_text = pytesseract.image_to_string(image)
+                            
+                            if not extracted_text.strip():
+                                st.error("❌ No text found in image. Please upload a clearer image with visible text.")
+                            else:
+                                st.success(f"✅ Extracted {len(extracted_text)} characters")
+                                
+                                # Show extracted text
+                                with st.expander("📄 Extracted Text", expanded=True):
+                                    st.text_area("", extracted_text, height=150, key="extracted_text_display")
+                                
+                                # Analyze the extracted text
+                                with st.spinner("🔍 Analyzing for fraud..."):
+                                    result = predict_fraud(extracted_text)
+                                    
+                                    st.markdown("---")
+                                    st.subheader("🎯 Fraud Analysis Result")
+                                    
+                                    if result['prediction'] == 'SCAM':
+                                        st.markdown(f"""
+                                        <div class="company-box fake-company">
+                                            <h2 style="color: #f44336;">🚨 SCAM DETECTED</h2>
+                                            <p style="font-size: 1.5rem;">Confidence: {result['confidence']:.1%}</p>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                    else:
+                                        st.markdown(f"""
+                                        <div class="company-box legit-company">
+                                            <h2 style="color: #4caf50;">✅ APPEARS LEGITIMATE</h2>
+                                            <p style="font-size: 1.5rem;">Confidence: {(1-result['confidence']):.1%}</p>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                    
+                                    # Show model confidence
+                                    bert_conf = result.get('bert_confidence')
+                                    rf_conf = result.get('rf_confidence')
+                                    
+                                    col_a, col_b = st.columns(2)
+                                    with col_a:
+                                        if bert_conf is not None:
+                                            st.metric("🤖 BERT Confidence", f"{bert_conf:.1%}")
+                                    with col_b:
+                                        if rf_conf is not None:
+                                            st.metric("🌲 Random Forest", f"{rf_conf:.1%}")
+                                    
+                                    # Show red flags
+                                    if result['critical_flags']:
+                                        st.error("**🚨 Critical Red Flags:**")
+                                        for flag in result['critical_flags']:
+                                            st.write(f"- {flag}")
+                                    
+                                    if result['warning_flags']:
+                                        st.warning("**⚠️ Warning Signs:**")
+                                        for flag in result['warning_flags']:
+                                            st.write(f"- {flag}")
+                    
+                    except ImportError as e:
+                        st.error("❌ OCR libraries not installed!")
+                        st.code("pip install pytesseract pillow", language="bash")
+                        st.info("Tesseract OCR must also be installed on your system. Visit: https://github.com/tesseract-ocr/tesseract")
+                    
+                    except Exception as e:
+                        st.error(f"❌ Error during OCR: {str(e)}")
+                        st.info("💡 Tips:\n- Ensure image has clear, readable text\n- Try a higher resolution image\n- Make sure Tesseract is properly installed")
+        
+        # OCR Tips
+        st.markdown("---")
+        with st.expander("💡 Tips for Better OCR Results"):
+            st.markdown("""
+            **For Best Results:**
+            - ✅ Use high-resolution images (at least 300 DPI)
+            - ✅ Ensure text is clear and not blurry
+            - ✅ Good lighting and contrast
+            - ✅ Avoid skewed or rotated images
+            - ✅ PNG or JPEG format recommended
+            
+            **Supported Formats:**
+            - PNG, JPEG, JPG, WEBP, BMP
+            
+            **Example Use Cases:**
+            - Screenshots of job postings from WhatsApp
+            - Email screenshots
+            - Social media job ads
+            - Printed job offers (scanned)
+            """)
 
 # ==========================================
 # TAB 5: MODEL INFO
