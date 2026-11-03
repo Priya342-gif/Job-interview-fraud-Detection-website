@@ -13,9 +13,24 @@ from scipy.sparse import hstack
 import json
 import os
 from dotenv import load_dotenv
+import platform
 
 # Load environment variables
 load_dotenv()
+
+# Configure Tesseract path for Windows
+if platform.system() == 'Windows':
+    import pytesseract
+    # Common Tesseract installation paths on Windows
+    tesseract_paths = [
+        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+        r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+        r'C:\Users\HP\AppData\Local\Programs\Tesseract-OCR\tesseract.exe',
+    ]
+    for path in tesseract_paths:
+        if os.path.exists(path):
+            pytesseract.pytesseract.tesseract_cmd = path
+            break
 
 # Import email checker
 from email_checker import (
@@ -120,9 +135,11 @@ def load_bert_model():
         )
         return clf, None, 'zero-shot'
 
-    except ImportError:
+    except ImportError as e:
+        st.sidebar.warning(f"BERT unavailable: Missing dependencies ({str(e)})")
         return None, None, None
-    except Exception:
+    except Exception as e:
+        st.sidebar.warning(f"BERT unavailable: {str(e)}")
         return None, None, None
 
 
@@ -188,43 +205,115 @@ def detect_red_flags(text):
     critical_flags = []
     warning_flags = []
     
-    # Check if email is from trusted sender first
+    # Check if email is from VERIFIED trusted sender
     trusted_keywords = [
-        'google', 'microsoft', 'amazon', 'apple', 'linkedin', 'facebook',
-        'noreply', 'no-reply', 'donotreply', 'notifications', 'security-noreply',
-        'alert', 'team', 'support'
+        '@google.com', '@microsoft.com', '@amazon.com', '@apple.com', 
+        '@linkedin.com', '@facebook.com', 'noreply@', 'no-reply@'
     ]
     
-    # If from trusted source, be less strict
+    # Only trust if it has @ domain pattern (actual email)
     is_trusted = any(keyword in text_lower for keyword in trusted_keywords)
     
-    # Only flag if NOT from trusted source AND contains suspicious patterns
-    if not is_trusted:
-        money_keywords = ['pay now', 'send money', 'transfer ₹', 'registration fee', 'training fee']
-        if any(keyword in text_lower for keyword in money_keywords):
-            critical_flags.append("💰 Money Request")
-        
-        if any(word in text_lower for word in ['send otp', 'share password', 'provide cvv']):
-            critical_flags.append("🔐 Sensitive Info Request")
-        
-        if any(phrase in text_lower for phrase in ['selected without interview', 'no interview required', 'directly selected']):
-            critical_flags.append("⚠️ No Interview Selection")
-        
-        if ('job' in text_lower or 'interview' in text_lower) and re.search(r'hr@gmail\.com|recruitment@yahoo\.com', text_lower):
-            critical_flags.append("📧 Personal Email Domain")
-        
-        if 'whatsapp only' in text_lower or 'contact on whatsapp' in text_lower:
-            critical_flags.append("📱 WhatsApp Only Communication")
-        
-        if any(word in text_lower for word in ['buy equipment', 'purchase laptop', 'training fee required']):
-            critical_flags.append("🛒 Required Purchase")
+    # ==========================================
+    # CRITICAL RED FLAGS (INSTANT SCAM)
+    # ==========================================
     
-    # WARNING FLAGS - less strict
+    # Money Request - ANY amount requested before job = SCAM
+    money_patterns = [
+        r'pay.*₹\s*\d+', r'pay.*rs\s*\d+', r'pay.*\$\s*\d+',
+        r'send.*₹\s*\d+', r'send.*rs\s*\d+', r'send.*\$\s*\d+',
+        r'transfer.*₹\s*\d+', r'transfer.*rs\s*\d+',
+        r'₹\s*\d+.*fee', r'rs\s*\d+.*fee', r'\$\s*\d+.*fee',
+        'registration fee', 'training fee', 'processing fee',
+        'confirmation fee', 'onboarding fee', 'security deposit',
+        'pay now', 'send money', 'payment required'
+    ]
+    
+    for pattern in money_patterns:
+        if re.search(pattern, text_lower):
+            critical_flags.append("💰 Money Request Before Job")
+            break
+    
+    # Sensitive Info Request
+    sensitive_patterns = [
+        'send otp', 'share otp', 'provide otp',
+        'share password', 'send password',
+        'cvv', 'card details', 'bank password',
+        'account password', 'pin number'
+    ]
+    if any(word in text_lower for word in sensitive_patterns):
+        critical_flags.append("🔐 Sensitive Info Request")
+    
+    # No Interview Red Flag
+    no_interview_patterns = [
+        'selected without interview',
+        'no interview required',
+        'directly selected',
+        'join immediately without interview',
+        'instant selection'
+    ]
+    if any(phrase in text_lower for phrase in no_interview_patterns):
+        critical_flags.append("⚠️ No Interview Selection")
+    
+    # Personal Email Domain for Job
+    if ('job' in text_lower or 'interview' in text_lower or 'selected' in text_lower):
+        if re.search(r'@gmail\.com|@yahoo\.com|@hotmail\.com|@outlook\.com', text_lower):
+            critical_flags.append("📧 Personal Email Domain")
+    
+    # WhatsApp Only Communication
+    whatsapp_patterns = [
+        'whatsapp only', 'contact on whatsapp',
+        'message on whatsapp', 'whatsapp me',
+        'wa.me', 'chat.whatsapp.com'
+    ]
+    if any(pattern in text_lower for pattern in whatsapp_patterns):
+        critical_flags.append("📱 WhatsApp Only Communication")
+    
+    # Required Purchase
+    purchase_patterns = [
+        'buy equipment', 'purchase laptop',
+        'buy software', 'purchase tools',
+        'training fee required', 'must pay for'
+    ]
+    if any(pattern in text_lower for pattern in purchase_patterns):
+        critical_flags.append("🛒 Required Purchase")
+    
+    # Cryptocurrency/Gift Card Payment
+    crypto_patterns = [
+        'bitcoin', 'cryptocurrency', 'gift card',
+        'google play', 'itunes card', 'amazon gift'
+    ]
+    if any(pattern in text_lower for pattern in crypto_patterns):
+        critical_flags.append("💳 Cryptocurrency/Gift Card Payment")
+    
+    # ==========================================
+    # WARNING FLAGS
+    # ==========================================
+    
+    # Excessive Exclamations
     if text.count('!') > 5:
         warning_flags.append("❗ Excessive Exclamations")
     
-    if not is_trusted and any(word in text_lower for word in ['urgent action', 'immediate action', 'act fast']):
+    # Urgency Pressure
+    urgency_patterns = [
+        'urgent', 'immediate', 'act fast', 'limited time',
+        'hurry', 'quick', 'asap', 'right now'
+    ]
+    if any(word in text_lower for word in urgency_patterns):
         warning_flags.append("⏰ Urgency Pressure")
+    
+    # Too Good To Be True
+    too_good_patterns = [
+        'easy money', 'work from home earn',
+        'guaranteed income', 'no experience needed high salary',
+        'earn lakhs', 'earn thousands'
+    ]
+    if any(pattern in text_lower for pattern in too_good_patterns):
+        warning_flags.append("🎯 Too Good To Be True")
+    
+    # Grammar/Spelling Issues
+    if re.search(r'\b(ur|pls|plz|gud|gud|thn|thx)\b', text_lower):
+        warning_flags.append("📝 Poor Grammar/Spelling")
     
     return critical_flags, warning_flags
 
@@ -287,16 +376,26 @@ def predict_fraud(text):
     critical, warnings = detect_red_flags(text)
     final_prediction   = "SCAM" if final_pred == 1 else "LEGITIMATE"
 
-    # --- Red-Flag Override (applied on top of BERT) ---
-    if len(critical) >= 2:
+    # ==========================================
+    # RED-FLAG OVERRIDE (AGGRESSIVE)
+    # ==========================================
+    # ANY single critical flag = INSTANT SCAM
+    # Money before job = ALWAYS SCAM
+    
+    if len(critical) >= 1:
+        # ANY critical red flag = Force SCAM
         final_prediction = "SCAM"
         final_prob = max(final_prob, 0.95)
-    elif len(critical) >= 1 and final_pred == 1:
-        final_prediction = "SCAM"
-        final_prob = max(final_prob, 0.90)
-    elif len(warnings) >= 4:
+    
+    elif len(warnings) >= 3:
+        # 3+ warnings = Force SCAM
         final_prediction = "SCAM"
         final_prob = max(final_prob, 0.85)
+    
+    elif len(warnings) >= 2 and final_pred == 1:
+        # 2 warnings + model says scam = Force SCAM
+        final_prediction = "SCAM"
+        final_prob = max(final_prob, 0.80)
 
     return {
         'prediction':      final_prediction,
